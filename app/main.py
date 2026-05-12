@@ -3,9 +3,10 @@ from flask import Flask, jsonify, request
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 import sqlite3
 import time
+import os
 
 app = Flask(__name__)
-DB_PATH = "todos.db"
+DB_PATH = os.environ.get("DB_PATH", "todos.db")
 
 REQUEST_COUNT = Counter("http_requests_total", "Total HTTP requests", ["method", "endpoint", "status"])
 REQUEST_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["endpoint"])

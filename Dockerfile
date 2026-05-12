@@ -11,8 +11,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
 
+# Create a writable directory for the SQLite database
+RUN mkdir -p /home/appuser/data && chown appuser:appuser /home/appuser/data
+
 USER appuser
 
 EXPOSE 5000
+
+ENV DB_PATH=/home/appuser/data/todos.db
 
 CMD ["python", "app/main.py"]
