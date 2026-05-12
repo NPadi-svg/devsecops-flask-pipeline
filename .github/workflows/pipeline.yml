@@ -163,6 +163,9 @@ jobs:
     name: DAST (OWASP ZAP)
     runs-on: ubuntu-latest
     needs: build-and-scan
+    permissions:
+      issues: write
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -200,11 +203,14 @@ jobs:
       - name: Run OWASP ZAP baseline scan
         uses: zaproxy/action-baseline@v0.12.0
         with:
-          target: http://localhost:5000
+          target: http://localhost:5000/health
           rules_file_name: .zap/rules.tsv
           cmd_options: '-a'
-          fail_action: false      # Report findings, don't fail pipeline yet
+          fail_action: false
           artifact_name: zap-report
+          issue_title: ZAP Scan Report
+          token: ${{ secrets.GITHUB_TOKEN }}
+          allow_issue_writing: false
 
       - name: Stop application container
         if: always()

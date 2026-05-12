@@ -30,6 +30,14 @@ def init_db():
 def health():
     return jsonify({"status": "ok"})
 
+@app.route("/")
+def index():
+    return jsonify({
+        "app": "DevSecOps Flask API",
+        "version": "1.0.0",
+        "endpoints": ["/health", "/metrics", "/todos"]
+    })
+
 @app.route("/metrics")
 def metrics():
     return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
