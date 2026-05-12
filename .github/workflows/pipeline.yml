@@ -1,0 +1,212 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  PYTHON_VERSION: "3.11"
+  IMAGE_NAME: devsecops-flask-app
+
+jobs:
+
+  # ─────────────────────────────────────────
+  # JOB 1: Secrets Scanning
+  # Runs first — if credentials are found, nothing else runs
+  # ─────────────────────────────────────────
+  secrets-scan:
+    name: Secrets Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # Full history so Gitleaks can scan all commits
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─────────────────────────────────────────
+  # JOB 2: SAST — Static Analysis
+  # Scans source code for vulnerabilities before anything is built
+  # ─────────────────────────────────────────
+  sast:
+    name: SAST (Bandit + Semgrep)
+    runs-on: ubuntu-latest
+    needs: secrets-scan           # Only runs if secrets scan passes
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install bandit semgrep
+
+      - name: Run Bandit (Python SAST)
+        run: |
+          bandit -r app/ -f json -o bandit-report.json || true
+          bandit -r app/ -f txt
+        continue-on-error: true   # We want to see results even if issues found
+
+      - name: Run Semgrep (OWASP Top 10)
+        run: |
+          semgrep --config=p/owasp-top-ten \
+                  --config=p/python \
+                  app/ \
+                  --json \
+                  --output semgrep-report.json || true
+          semgrep --config=p/owasp-top-ten app/ || true
+
+      - name: Upload SAST reports
+        uses: actions/upload-artifact@v4
+        if: always()              # Upload even if scan found issues
+        with:
+          name: sast-reports
+          path: |
+            bandit-report.json
+            semgrep-report.json
+          retention-days: 30
+
+  # ─────────────────────────────────────────
+  # JOB 3: Unit Tests
+  # ─────────────────────────────────────────
+  test:
+    name: Unit Tests (pytest)
+    runs-on: ubuntu-latest
+    needs: secrets-scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ -v \
+            --cov=app \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 30
+
+  # ─────────────────────────────────────────
+  # JOB 4: Build & Container Scan
+  # Builds the Docker image then scans it for CVEs
+  # ─────────────────────────────────────────
+  build-and-scan:
+    name: Build + Trivy Container Scan
+    runs-on: ubuntu-latest
+    needs: [ sast, test ]         # Needs both SAST and tests to pass
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+                     ${{ env.IMAGE_NAME }}:latest
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:latest
+          format: table
+          exit-code: 0            # Don't fail pipeline yet — report only
+          severity: CRITICAL,HIGH
+          output: trivy-report.txt
+
+      - name: Upload Trivy report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-report
+          path: trivy-report.txt
+          retention-days: 30
+
+      - name: Save Docker image as artifact
+        run: docker save ${{ env.IMAGE_NAME }}:latest | gzip > image.tar.gz
+
+      - name: Upload Docker image
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image.tar.gz
+          retention-days: 1       # Short retention — just for next job
+
+  # ─────────────────────────────────────────
+  # JOB 5: DAST — Dynamic Analysis
+  # Starts the container and attacks it with OWASP ZAP
+  # ─────────────────────────────────────────
+  dast:
+    name: DAST (OWASP ZAP)
+    runs-on: ubuntu-latest
+    needs: build-and-scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        run: docker load < image.tar.gz
+
+      - name: Start application container
+        run: |
+          docker run -d \
+            --name flask-app \
+            -p 5000:5000 \
+            ${{ env.IMAGE_NAME }}:latest
+          # Wait for app to be ready
+          sleep 5
+          curl --retry 5 --retry-delay 2 http://localhost:5000/health
+
+      - name: Run OWASP ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: http://localhost:5000
+          rules_file_name: .zap/rules.tsv
+          cmd_options: '-a'
+          fail_action: false      # Report findings, don't fail pipeline yet
+          artifact_name: zap-report
+
+      - name: Stop application container
+        if: always()
+        run: docker stop flask-app && docker rm flask-app
+
+  # ─────────────────────────────────────────
+  # JOB 6: Deploy (AWS) — wired in Phase 6
+  # Placeholder so the pipeline structure is complete
+  # ─────────────────────────────────────────
+  deploy:
+    name: Deploy to AWS ECS
+    runs-on: ubuntu-latest
+    needs: [ build-and-scan, dast ]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Deploy placeholder
+        run: echo "Deploy stage — AWS credentials and ECS config added in Phase 6"
